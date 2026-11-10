@@ -825,5 +825,50 @@ TEST_F(KernelArgumentsTest, ProtoRoundTrip) {
   EXPECT_THAT(round_trip_proto, EqualsProto(proto));
 }
 
+TEST_F(KernelArgumentsTest,
+       CreateWithPreconfiguredUnmanagedArgumentsPreservesPositionsAndAttrs) {
+  ASSERT_OK_AND_ASSIGN(std::unique_ptr<VerifiedHloModule> module,
+                       ParseAndReturnVerifiedModule(R"(
+    ENTRY main {
+      p0 = f32[4] parameter(0)
+      ROOT r = f32[4] negate(p0)
+    }
+  )"));
+  const HloInstruction* root = module->entry_computation()->root_instruction();
+  BufferAllocation alloc(/*index=*/0, /*size=*/32, /*color=*/0);
+  auto slice_provider =
+      [&](const HloInstruction& instruction,
+          const ShapeIndex& index) -> absl::StatusOr<BufferAllocation::Slice> {
+    int64_t offset = (&instruction == root) ? 16 : 0;
+    return BufferAllocation::Slice(&alloc, offset, 16);
+  };
+  std::vector<KernelArgument> unmanaged = {
+      KernelArgument::CreateUnmanaged(ShapeUtil::MakeShape(U64, {2}),
+                                      /*alignment=*/16, /*written=*/false,
+                                      /*aliased=*/false),
+      KernelArgument::CreateUnmanaged(ShapeUtil::MakeShape(S32, {}),
+                                      /*alignment=*/0, /*written=*/false,
+                                      /*aliased=*/false),
+  };
+  ASSERT_OK_AND_ASSIGN(
+      KernelArguments args,
+      KernelArguments::Create(slice_provider, gpu::GetDefaultBufferAlignment(),
+                              root, absl::MakeConstSpan(unmanaged)));
+  EXPECT_THAT(args.PositionOfOperand(0), IsOkAndHolds(0));
+  EXPECT_THAT(args.PositionOfResult({}), IsOkAndHolds(1));
+  ASSERT_THAT(args.args(), SizeIs(4));
+  EXPECT_EQ(args.args()[2].kind(), KernelArgument::Kind::kUnmanaged);
+  EXPECT_EQ(args.args()[2].dereferenceable_bytes(), 16);
+  EXPECT_EQ(args.args()[2].alignment(), 16);
+  EXPECT_FALSE(args.args()[2].written());
+  EXPECT_FALSE(args.args()[2].aliased());
+  EXPECT_EQ(args.args()[2].slice_index(), -1);
+  EXPECT_EQ(args.args()[3].kind(), KernelArgument::Kind::kUnmanaged);
+  EXPECT_EQ(args.args()[3].dereferenceable_bytes(), 0);
+  EXPECT_EQ(args.args()[3].alignment(), 0);
+  EXPECT_FALSE(args.args()[3].written());
+  EXPECT_FALSE(args.args()[3].aliased());
+  EXPECT_EQ(args.args()[3].slice_index(), -1);
+}
 }  // namespace
 }  // namespace xla::emitters

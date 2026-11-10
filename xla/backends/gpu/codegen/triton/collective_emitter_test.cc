@@ -35,7 +35,13 @@ limitations under the License.
 #include "absl/strings/str_join.h"
 #include "absl/strings/string_view.h"
 #include "llvm/ADT/SmallVector.h"
+#include "llvm/IR/Attributes.h"
+#include "llvm/IR/DerivedTypes.h"
+#include "llvm/IR/Function.h"
+#include "llvm/IR/LLVMContext.h"
 #include "llvm/IR/Module.h"
+#include "llvm/IR/Type.h"
+#include "llvm/Support/Alignment.h"
 #include "llvm/TargetParser/Triple.h"
 #include "mlir/IR/MLIRContext.h"
 #include "xla/backends/gpu/codegen/cubin_custom_kernel_compiler.h"
@@ -48,6 +54,7 @@ limitations under the License.
 #include "xla/backends/gpu/target_config/target_config.h"
 #include "xla/backends/gpu/transforms/collectives/collective_fusion.h"
 #include "xla/backends/gpu/transforms/collectives/collective_kernel_strategy_annotator.h"
+#include "xla/codegen/emitters/kernel_arguments.h"
 #include "xla/codegen/xtile/xtile_config.pb.h"
 #include "xla/hlo/ir/hlo_casting_utils.h"
 #include "xla/hlo/ir/hlo_instruction.h"
@@ -57,6 +64,8 @@ limitations under the License.
 #include "xla/hlo/utils/hlo_query.h"
 #include "xla/primitive_util.h"
 #include "xla/runtime/object_pool.h"
+#include "xla/service/buffer_assignment.h"
+#include "xla/service/gpu/gpu_constants.h"
 #include "xla/service/gpu/gpu_device_info_for_tests.h"
 #include "xla/service/gpu/hlo_fusion_analysis.h"
 #include "xla/service/gpu/mlir_context_pool.h"
@@ -91,6 +100,16 @@ MATCHER_P(HasOpcode, expected_opcode, "") {
 }
 MATCHER_P(HasNumOperands, expected_operands, "") {
   return arg != nullptr && arg->operand_count() == expected_operands;
+}
+
+std::vector<Shape> UnmanagedShapes(
+    const std::vector<emitters::KernelArgument>& args) {
+  std::vector<Shape> shapes;
+  shapes.reserve(args.size());
+  for (const emitters::KernelArgument& arg : args) {
+    shapes.push_back(arg.shape());
+  }
+  return shapes;
 }
 
 struct ModuleWithFusion {
@@ -370,9 +389,10 @@ TEST_F(CollectiveEmitterTest, AllReduceGetCollectiveUnmanagedKernelArguments) {
   ASSERT_OK_AND_ASSIGN(
       const auto unmanaged_arguments,
       GetCollectiveUnmanagedKernelArguments(module_with_fusion.FusionInstr()));
-  EXPECT_THAT(unmanaged_arguments, ElementsAre(ShapeUtil::MakeShape(U64, {2}),
-                                               ShapeUtil::MakeShape(U64, {2}),
-                                               ShapeUtil::MakeShape(S32, {})));
+  EXPECT_THAT(UnmanagedShapes(unmanaged_arguments),
+              ElementsAre(ShapeUtil::MakeShape(U64, {2}),
+                          ShapeUtil::MakeShape(U64, {2}),
+                          ShapeUtil::MakeShape(S32, {})));
 }
 
 TEST_F(CollectiveEmitterTest, AllReduceWithTritonGetLaunchConfig) {
@@ -577,9 +597,10 @@ TEST_F(CollectiveEmitterTest, AllGatherGetCollectiveUnmanagedKernelArguments) {
   ASSERT_OK_AND_ASSIGN(
       const auto unmanaged_arguments,
       GetCollectiveUnmanagedKernelArguments(module_with_fusion.FusionInstr()));
-  EXPECT_THAT(unmanaged_arguments, ElementsAre(ShapeUtil::MakeShape(U64, {2}),
-                                               ShapeUtil::MakeShape(U64, {2}),
-                                               ShapeUtil::MakeShape(S32, {})));
+  EXPECT_THAT(UnmanagedShapes(unmanaged_arguments),
+              ElementsAre(ShapeUtil::MakeShape(U64, {2}),
+                          ShapeUtil::MakeShape(U64, {2}),
+                          ShapeUtil::MakeShape(S32, {})));
 }
 
 TEST_F(CollectiveBlockLevelConfigTest,
@@ -654,9 +675,10 @@ TEST_F(CollectiveEmitterTest, AllToAllGetCollectiveUnmanagedKernelArguments) {
   ASSERT_OK_AND_ASSIGN(
       const auto unmanaged_arguments,
       GetCollectiveUnmanagedKernelArguments(module_with_fusion.FusionInstr()));
-  EXPECT_THAT(unmanaged_arguments, ElementsAre(ShapeUtil::MakeShape(U64, {2}),
-                                               ShapeUtil::MakeShape(U64, {2}),
-                                               ShapeUtil::MakeShape(S32, {})));
+  EXPECT_THAT(UnmanagedShapes(unmanaged_arguments),
+              ElementsAre(ShapeUtil::MakeShape(U64, {2}),
+                          ShapeUtil::MakeShape(U64, {2}),
+                          ShapeUtil::MakeShape(S32, {})));
 }
 
 TEST_F(CollectiveBlockLevelConfigTest,
@@ -742,9 +764,10 @@ TEST_F(CollectiveEmitterTest,
   ASSERT_OK_AND_ASSIGN(
       const auto unmanaged_arguments,
       GetCollectiveUnmanagedKernelArguments(module_with_fusion.FusionInstr()));
-  EXPECT_THAT(unmanaged_arguments, ElementsAre(ShapeUtil::MakeShape(U64, {2}),
-                                               ShapeUtil::MakeShape(U64, {2}),
-                                               ShapeUtil::MakeShape(S32, {})));
+  EXPECT_THAT(UnmanagedShapes(unmanaged_arguments),
+              ElementsAre(ShapeUtil::MakeShape(U64, {2}),
+                          ShapeUtil::MakeShape(U64, {2}),
+                          ShapeUtil::MakeShape(S32, {})));
 }
 
 constexpr absl::string_view kVariadicReduceScatterModuleStr = R"(
@@ -951,10 +974,11 @@ TEST_F(CollectiveEmitterTest,
   ASSERT_OK_AND_ASSIGN(
       const auto unmanaged_arguments,
       GetCollectiveUnmanagedKernelArguments(module_with_fusion.FusionInstr()));
-  EXPECT_THAT(unmanaged_arguments, ElementsAre(ShapeUtil::MakeShape(U64, {2}),
-                                               ShapeUtil::MakeShape(U64, {2}),
-                                               ShapeUtil::MakeShape(U64, {2}),
-                                               ShapeUtil::MakeShape(S32, {})));
+  EXPECT_THAT(UnmanagedShapes(unmanaged_arguments),
+              ElementsAre(ShapeUtil::MakeShape(U64, {2}),
+                          ShapeUtil::MakeShape(U64, {2}),
+                          ShapeUtil::MakeShape(U64, {2}),
+                          ShapeUtil::MakeShape(S32, {})));
 }
 
 GpuTopology MakeGpuTopology(int32_t num_partitions,
@@ -1259,6 +1283,61 @@ TEST_F(CollectiveBlockLevelConfigTest,
   EXPECT_EQ(launch_config->launch_dimensions.num_threads_per_block(), 512);
 }
 
-}  // namespace
+llvm::Function* CreateAnnotatedDummyKernel(
+    const emitters::KernelArguments& kernel_args, llvm::Module& llvm_mod) {
+  llvm::LLVMContext& llvm_ctx = llvm_mod.getContext();
+  llvm::Type* ptr_ty = llvm::PointerType::getUnqual(llvm_ctx);
+  llvm::Type* i32_ty = llvm::Type::getInt32Ty(llvm_ctx);
+  std::vector<llvm::Type*> param_types;
+  param_types.reserve(kernel_args.args().size());
+  for (const emitters::KernelArgument& arg : kernel_args.args()) {
+    const bool is_scalar_unmanaged =
+        arg.kind() == emitters::KernelArgument::Kind::kUnmanaged &&
+        arg.shape().dimensions().empty();
+    param_types.push_back(is_scalar_unmanaged ? i32_ty : ptr_ty);
+  }
+  auto* fn = llvm::Function::Create(
+      llvm::FunctionType::get(llvm::Type::getVoidTy(llvm_ctx), param_types,
+                              /*isVarArg=*/false),
+      llvm::Function::ExternalLinkage, "kernel", llvm_mod);
+  AnnotateAttrsIfUnset(kernel_args, *fn);
+  return fn;
+}
 
+TEST_F(CollectiveEmitterTest,
+       CreateCollectiveKernelArgumentsMarksPeerPointerTables) {
+  ASSERT_OK_AND_ASSIGN(
+      ModuleWithFusion module_with_fusion,
+      BuildModuleWithFusion(GetModuleStr(ShapeUtil::MakeShape(F32, {65536}),
+                                         "{0,1}", HloOpcode::kAllReduce)));
+  const HloFusionInstruction* fusion = module_with_fusion.FusionInstr();
+  BufferAllocation alloc(/*index=*/0, /*size=*/524288, /*color=*/0);
+  auto slice_provider =
+      [&](const HloInstruction& instr,
+          const ShapeIndex& idx) -> absl::StatusOr<BufferAllocation::Slice> {
+    int64_t offset = (&instr == fusion) ? 262144 : 0;
+    return BufferAllocation::Slice(&alloc, offset, 262144);
+  };
+  ASSERT_OK_AND_ASSIGN(
+      emitters::KernelArguments kernel_args,
+      CreateCollectiveKernelArguments(slice_provider,
+                                      GetDefaultBufferAlignment(), *fusion));
+  EXPECT_THAT(kernel_args.PositionOfOperand(0), IsOkAndHolds(0));
+  EXPECT_THAT(kernel_args.PositionOfResult({}), IsOkAndHolds(1));
+
+  llvm::LLVMContext llvm_ctx;
+  llvm::Module llvm_mod("test", llvm_ctx);
+  llvm::Function* fn = CreateAnnotatedDummyKernel(kernel_args, llvm_mod);
+
+  EXPECT_EQ(fn->getParamDereferenceableBytes(0), 262144);
+  EXPECT_EQ(fn->getParamAlign(0), llvm::MaybeAlign(256));
+  for (unsigned idx : {2u, 3u}) {
+    EXPECT_EQ(fn->getParamDereferenceableBytes(idx), 16);
+    EXPECT_EQ(fn->getParamAlign(idx), llvm::MaybeAlign(16));
+    EXPECT_TRUE(fn->hasParamAttribute(idx, llvm::Attribute::NoAlias));
+    EXPECT_TRUE(fn->hasParamAttribute(idx, llvm::Attribute::ReadOnly));
+  }
+}
+
+}  // namespace
 }  // namespace xla::gpu
