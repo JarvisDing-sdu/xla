@@ -89,6 +89,42 @@ TEST(ShapeTest, NonZeroDimsNumElements) {
   }
 }
 
+TEST(ShapeTest, NumElementsValidatesDimensionsAndOverflow) {
+  EXPECT_THAT(Shape({}).NumElements(), ::absl_testing::IsOkAndHolds(1));
+  EXPECT_THAT(Shape({100, 200}).NumElements(),
+              ::absl_testing::IsOkAndHolds(20000));
+
+  constexpr int64_t kOverflowSide = int64_t{1} << 32;
+  EXPECT_THAT(Shape({0, kOverflowSide, kOverflowSide}).NumElements(),
+              ::absl_testing::IsOkAndHolds(0));
+  EXPECT_THAT(Shape({kOverflowSide, kOverflowSide, 0}).NumElements(),
+              ::absl_testing::IsOkAndHolds(0));
+
+  EXPECT_THAT(Shape({4, -1}).NumElements(),
+              ::absl_testing::StatusIs(absl::StatusCode::kInvalidArgument,
+                                       HasSubstr("non-negative")));
+  EXPECT_THAT(Shape({0, -1}).NumElements(),
+              ::absl_testing::StatusIs(absl::StatusCode::kInvalidArgument,
+                                       HasSubstr("non-negative")));
+  EXPECT_THAT(Shape({-2, -3}).NumElements(),
+              ::absl_testing::StatusIs(absl::StatusCode::kInvalidArgument,
+                                       HasSubstr("non-negative")));
+  EXPECT_THAT(
+      Shape({kOverflowSide, kOverflowSide}).NumElements(),
+      ::absl_testing::StatusIs(absl::StatusCode::kInvalidArgument,
+                               HasSubstr("Too large number of elements")));
+}
+
+TEST(ShapeDeathTest, NumElementsFailsOnNegativeOrOverflowingDimensions) {
+  EXPECT_DEATH((void)Shape({4, -1}).num_elements(),
+               "Shape expects non-negative dimension sizes");
+  EXPECT_DEATH((void)Shape({-2, -3}).num_elements(),
+               "Shape expects non-negative dimension sizes");
+  constexpr int64_t kOverflowSide = int64_t{1} << 32;
+  EXPECT_DEATH((void)Shape({kOverflowSide, kOverflowSide}).num_elements(),
+               "Too large number of elements");
+}
+
 class ShapeSerDesTest : public testing::TestWithParam<SerDesVersion> {
  public:
   ShapeSerDesTest() : version_(GetParam()) {}

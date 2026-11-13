@@ -15,6 +15,7 @@
 #include "xla/python/ifrt_proxy/common/array_util.h"
 
 #include <cstddef>
+#include <cstdint>
 #include <memory>
 #include <string>
 #include <vector>
@@ -81,11 +82,20 @@ absl::StatusOr<ArrayMemRegion> ArrayMemRegion::FromZerothElementPointer(
   // is different from mem_region_start.
   void* const mem_region_start = const_cast<void*>(zeroth_element);
 
+  ABSL_ASSIGN_OR_RETURN(const int64_t num_elements, shape.NumElements());
   if (!byte_strides.has_value() ||
       (byte_strides->empty() && shape.dims().empty())) {
-    return ArrayMemRegion(mem_region_start, byte_size * shape.num_elements());
+    size_t mem_region_size = 0;
+    if (__builtin_mul_overflow(static_cast<size_t>(byte_size),
+                               static_cast<size_t>(num_elements),
+                               &mem_region_size)) {
+      return absl::InvalidArgumentError(
+          absl::StrCat("Byte size overflows size_t for dtype ", dtype,
+                       " and shape ", shape));
+    }
+    return ArrayMemRegion(mem_region_start, mem_region_size);
   }
-  if (shape.num_elements() == 0) {
+  if (num_elements == 0) {
     return ArrayMemRegion(mem_region_start, 0);
   }
   if (shape.dims().size() != byte_strides->size()) {
