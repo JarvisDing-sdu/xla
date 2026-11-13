@@ -40,6 +40,79 @@ void Pack4Impl(const uint8_t* HWY_RESTRICT in, size_t count,
   const size_t lanes = hn::Lanes(d8);
   const auto mask_4 = hn::Set(d8, 0x0F);
   const size_t vector_stride = 2 * lanes;
+
+#if HWY_TARGET <= HWY_AVX3
+  // Multiply each pair of adjacent masked bytes by (1, 16) via vpmaddubsw so
+  // each 16-bit lane holds low + 16 * high in [0, 255] without saturation,
+  // then pack the low bytes and finish any <128-element tail with AVX-512BW
+  // masked loads/stores.
+  const hn::Rebind<int8_t, decltype(d8)> di8;
+  const hn::Repartition<int16_t, decltype(d8)> di16;
+  const hn::Half<decltype(d8)> d8_half;
+  const auto mul_1_16 = hn::Dup128VecFromValues(di8, 1, 16, 1, 16, 1, 16, 1, 16,
+                                                1, 16, 1, 16, 1, 16, 1, 16);
+
+  // Up to lanes inputs: one masked block. The optimizer sees that the products
+  // fit in a byte, so DemoteTo becomes a masked vpmovwb store.
+  if (count <= lanes) {
+    if (count > 0) {
+      const auto v = hn::And(hn::LoadN(d8, in, count), mask_4);
+      const auto p = hn::SatWidenMulPairwiseAdd(di16, v, mul_1_16);
+      hn::StoreN(hn::DemoteTo(d8_half, p), d8_half, out, (count + 1) / 2);
+    }
+    return;
+  }
+
+  auto mul = mul_1_16;
+#if HWY_COMPILER_GCC && HWY_TARGET <= HWY_AVX3_DL && HWY_TARGET != HWY_AVX3_ZEN4
+  // Hide mul from the optimizer. Otherwise LLVM's known bits for vpmaddubsw
+  // prove that vpackuswb cannot saturate, and with AVX512VBMI it fuses
+  // vpackuswb + vpermq into one vpermt2b, which is 3 uops (2 on port 5) on
+  // Intel instead of 2. On AMD Zen4 the fused form is faster.
+  __asm__("" : "+v"(mul.raw));
+#endif
+  // Packs vector_stride inputs at src into lanes bytes at dst.
+  const auto pack_block = [&](const uint8_t* src, uint8_t* dst) HWY_ATTR {
+    const auto v0 = hn::And(hn::LoadU(d8, src), mask_4);
+    const auto v1 = hn::And(hn::LoadU(d8, src + lanes), mask_4);
+    const auto p0 = hn::SatWidenMulPairwiseAdd(di16, v0, mul);
+    const auto p1 = hn::SatWidenMulPairwiseAdd(di16, v1, mul);
+    hn::StoreU(hn::OrderedDemote2To(d8, p0, p1), d8, dst);
+  };
+  size_t remaining = count;
+  // Inputs shorter than one block skip both loops with a single compare.
+  if (remaining >= vector_stride) {
+    // Unrolled 4x by hand, then up to 3 leftover blocks one at a time.
+    // HWY_UNROLL(1) stops LLVM from adding its own runtime unrolling, whose
+    // trip-count setup and remainder loop slow down small inputs.
+    HWY_UNROLL(1)
+    for (; remaining >= 4 * vector_stride; in += 4 * vector_stride,
+                                           out += 4 * lanes,
+                                           remaining -= 4 * vector_stride) {
+      pack_block(in, out);
+      pack_block(in + vector_stride, out + lanes);
+      pack_block(in + 2 * vector_stride, out + 2 * lanes);
+      pack_block(in + 3 * vector_stride, out + 3 * lanes);
+    }
+    HWY_UNROLL(1)
+    for (; remaining >= vector_stride;
+         in += vector_stride, out += lanes, remaining -= vector_stride) {
+      pack_block(in, out);
+    }
+  }
+  if (remaining > lanes) {
+    const auto v0 = hn::And(hn::LoadU(d8, in), mask_4);
+    const auto v1 =
+        hn::And(hn::LoadN(d8, in + lanes, remaining - lanes), mask_4);
+    const auto p0 = hn::SatWidenMulPairwiseAdd(di16, v0, mul);
+    const auto p1 = hn::SatWidenMulPairwiseAdd(di16, v1, mul);
+    hn::StoreN(hn::OrderedDemote2To(d8, p0, p1), d8, out, (remaining + 1) / 2);
+  } else if (remaining > 0) {
+    const auto v = hn::And(hn::LoadN(d8, in, remaining), mask_4);
+    const auto p = hn::SatWidenMulPairwiseAdd(di16, v, mul);
+    hn::StoreN(hn::DemoteTo(d8_half, p), d8_half, out, (remaining + 1) / 2);
+  }
+#else
   const size_t vector_inputs = (count / vector_stride) * vector_stride;
 
   for (size_t i = 0; i < vector_inputs; i += vector_stride) {
@@ -58,6 +131,7 @@ void Pack4Impl(const uint8_t* HWY_RESTRICT in, size_t count,
   if (count % 2 != 0) {
     out[aligned_inputs] = in[2 * aligned_inputs] & mask;
   }
+#endif
 }
 
 void Pack2Impl(const uint8_t* HWY_RESTRICT in, size_t count,
@@ -128,6 +202,56 @@ void Unpack4Impl(const uint8_t* HWY_RESTRICT in, size_t count,
                  uint8_t* HWY_RESTRICT out) {
   const hn::ScalableTag<uint8_t> d8;
   const size_t lanes = hn::Lanes(d8);
+
+#if HWY_TARGET <= HWY_AVX3
+  // Zero-extend each packed byte into a 16-bit lane (0x00HL), then expand
+  // (wide | (wide << 4)) & 0x0F0F -> 0x0H0L ([0x0L, 0x0H] in little-endian).
+  // Finish any <64-element tail with a single AVX-512BW masked load/store.
+  const hn::Half<decltype(d8)> d8_half;
+  const hn::Repartition<uint16_t, decltype(d8)> du16;
+  const auto mask_0f0f = hn::Set(du16, uint16_t{0x0F0F});
+  // Unpacks lanes / 2 bytes at src into lanes outputs at dst.
+  const auto unpack_vector = [&](const uint8_t* src, uint8_t* dst) HWY_ATTR {
+    const auto wide = hn::PromoteTo(du16, hn::LoadU(d8_half, src));
+    const auto unpacked =
+        hn::And(hn::Or(wide, hn::ShiftLeft<4>(wide)), mask_0f0f);
+    hn::StoreU(hn::BitCast(d8, unpacked), d8, dst);
+  };
+  size_t remaining = count;
+  if constexpr (HWY_TARGET <= HWY_AVX3_DL) {
+    // Same loop structure as in Pack4Impl, for the same reasons.
+    if (remaining >= lanes) {
+      HWY_UNROLL(1)
+      for (; remaining >= 4 * lanes;
+           in += 2 * lanes, out += 4 * lanes, remaining -= 4 * lanes) {
+        unpack_vector(in, out);
+        unpack_vector(in + lanes / 2, out + lanes);
+        unpack_vector(in + lanes, out + 2 * lanes);
+        unpack_vector(in + 3 * lanes / 2, out + 3 * lanes);
+      }
+      HWY_UNROLL(1)
+      for (; remaining >= lanes;
+           in += lanes / 2, out += lanes, remaining -= lanes) {
+        unpack_vector(in, out);
+      }
+    }
+  } else {
+    // AVX3 (Skylake-SP, Cascade Lake) keeps the plain loop, which LLVM
+    // unrolls itself; the loops above measured 4.7% slower there at 10000
+    // outputs.
+    for (; remaining >= lanes;
+         in += lanes / 2, out += lanes, remaining -= lanes) {
+      unpack_vector(in, out);
+    }
+  }
+  if (remaining > 0) {
+    const auto wide =
+        hn::PromoteTo(du16, hn::LoadN(d8_half, in, (remaining + 1) / 2));
+    const auto unpacked =
+        hn::And(hn::Or(wide, hn::ShiftLeft<4>(wide)), mask_0f0f);
+    hn::StoreN(hn::BitCast(d8, unpacked), d8, out, remaining);
+  }
+#else
   const auto mask_4 = hn::Set(d8, 0x0F);
   const size_t vector_stride = 2 * lanes;
   const size_t vector_outputs = (count / vector_stride) * vector_stride;
@@ -149,6 +273,7 @@ void Unpack4Impl(const uint8_t* HWY_RESTRICT in, size_t count,
   if (count % 2 != 0) {
     out[2 * aligned_outputs] = in[aligned_outputs] & mask;
   }
+#endif
 }
 
 void Unpack2Impl(const uint8_t* HWY_RESTRICT in, size_t count,
